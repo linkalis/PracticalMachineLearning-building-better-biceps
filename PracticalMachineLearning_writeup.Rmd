@@ -1,0 +1,139 @@
+---
+title: "Building better biceps through machine learning"
+author: "Alison Link"
+date: "December 21, 2015"
+output: html_document
+---
+
+### Executive summary
+This report examines accelerometer and gyroscope measurement data on biceps curling techniques.  It fits two models of increasing complexity to try to classify this data: 1) a cross-validated single decision tree model, and 2) a random forest model.  The random forest model yields a substantially lower expected out of sample error rate compared to the single decision tree model.  This suggests that the random forest model will likely have high predictive power when applied to new testing data.
+
+***
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(caret)
+library(rpart)
+library(randomForest)
+```
+
+## Load and prep training & testing data
+
+We will be examining a dataset provided by Velloso, et al. featuring accelerometer and gyroscope measurements from four different sensors placed on the arm, forearm, belt, and dumbbell of subjects as they performed biceps curls.  We will use these data to try to predict several classes of common errors subjects commit as they perform biceps curls.  Let's first load in the dataset:
+
+```{r}
+training_data <- read.csv("pml-training.csv", header=TRUE)
+testing_data <- read.csv("pml-testing.csv", header=TRUE)
+```
+
+There are some oddities in our training dataset: measurements were captured over a window of time, with summary variables (ex: stdev_roll_dumbbell, max_yaw_dumbbell, etc.) calculated at the end of each window. Our test data doesn't include these window variables, so it will not be helpful to include these when training our model.  Let's look at only the rows that represent the raw data, and not the computed windows.  We can also remove the timestamp and window variables at the beginning of each dataset that were used to calculate these windows.
+
+There are also a number of columns that contain zeroes or NAs.  Let's find these columns using the 'nearZeroVar' function from the 'caret' package and remove them from our training and testing data sets.
+
+```{r}
+# remove data "window" calculations, along with timestamp & window-related variables
+training_data <- training_data[training_data$new_window=="no", c(-3, -4, -5, -6, -7)]
+testing_data <- testing_data[training_data$new_window=="no", c(-3, -4, -5, -6, -7)]
+
+# remove zeroes & NA columns
+zero_cols <- nearZeroVar(training_data)
+training_data <- training_data[ , -zero_cols]
+testing_data <- testing_data[ , -zero_cols]
+```
+
+## Exploratory analysis
+
+Now, let's look at a basic table to understand how our dataset is structured.  It looks like our dataset contains information about six different weighlifters performing biceps curls in five different ways:
+
+```{r}
+table(training_data$user_name, training_data$classe)
+```
+
+We will have five different classes of biceps curls to try to predict in our model.  The paper by Velloso, et al. describes these classes in further detail:
+
+**A**: correct biceps curl
+
+**B**: throwing the elbows to the front 
+
+**C**: lifting the dumbbell only halfway
+
+**D**: lowering the dumbbell only halfway
+
+**E**: throwing the hips to the front
+
+Given this information, let's look at how some of our variables are structured, and see if they match our intuition.  Applying some knowledge of both accelerometers and biceps curls, for example, we might suspect that, for a correct bicep curl (class A) the subject should remain relatively erect with little movement in the waist or hips.  This means the pitch and roll measurements on the belt should remain relatively close to zero.  For error class E, however, the pitch and roll measurements on the belt will likely *stray* from zero in meaningful ways, indicating that the subject's hips are unsteady.
+
+These variables, then, could potentially be useful for helping to predict errors away from class A and towards class E.  Indeed, we see that, as expected, the "pitch\_belt" and "roll\_belt" variables generally rest around zero, but are bimodally distributed with both positive and negative readings also showing up frequently:
+
+```{r, echo=FALSE}
+par(mfrow=c(1,2))
+hist(training_data$pitch_belt, main="Histogram of pitch_belt")
+hist(training_data$roll_belt, main="Histogram of roll_belt")
+```
+
+It looks like many of our potential predictor variables display a high degree of this kind of variance and non-normality.  This seems intuitive for what we might expect of sensor data, where participants' body movements will reasonably result in non-normally-disributed measures on the X, Y, or Z measurement axes of our accelerometers and gyroscopes.  We will have to account for this phenomenon when fitting our models.
+
+
+## Fitting tree models
+
+We are trying to sort new data into classes of different types of bicep curls (labeled "classe" in our dataset).  Because this is a classification problem on data that are largely non-normally distributed, it makes sense to approach this with Classification and Regression Tree (CART)-type models, which work well for sorting data into class types, and are robust to the kind of non-normality in our predictor variables that we noticed above.
+
+
+### Model 1: Simple tree with 'rpart' & 10-fold cross-validation
+
+One of the more basic decision tree models we can fit is a single, simple decision tree using the 'rpart' package along with a relatively simple, 10-fold cross-validation technique: 
+
+```{r treeModelCV10, cache=TRUE}
+set.seed(1337)
+control_CV10 <- rpart.control(xval = 10)
+treeModelCV10 <- rpart(classe ~ ., method="class", data=training_data[ , 3:55], control=control_CV10)
+```
+
+When we fit this model, we notice several things: 
+
+First, it matches our intuition that "pitch\_belt" and "roll\_belt" are meaningful for classifying errors in how biceps curls are performed, as both of these variables show up as splits at various points on our decision tree.  It appears we are on the right track with this model-fitting methodology!
+
+```{r}
+print(treeModelCV10)
+```
+
+Second, our single, simple tree model has a relatively high misclassification rate.  If we look at the confusion matrix below, we see that, whereas a 'perfect' classifier would only display values along the diagonal of the matrix and "0"s in all other cells, our confusion matrix is such that some cases of each class type are being confused with other class types:
+
+```{r}
+predictions <- predict(treeModelCV10, training_data[ , 3:55], type="class")
+table(training_data$classe, predictions)
+```
+
+When we calculate the misclassification error rate, it appears we have a ~25% error rate in our model.  This is a relatively high misclassification rate, and because it is cross-validated, this metric also helps us estimate the out of sample error rate we can expect.  We can say with reasonable confidence, then, that **this model will likely have an error rate of ~25% or slightly higher if we were to apply the model to novel test data.**
+
+```{r}
+sum(predictions!=training_data$classe)/length(predictions) # calculate misclassification error rate
+```
+  
+
+### Model 2: Random forest
+
+Now, let's fit a substantially more complex model--and one that likely has much better predictive power.  We'll use a random forest to calculate multiple decision trees similar to the one above, but arranged as a "forest", so that each case of our training and testing data can be run through our model and classified with the aid of multiple trees that will help us catch greater nuance in our dataset.
+
+```{r randomForest, cache=TRUE}
+set.seed(1984)
+randomForestFit <- randomForest(classe ~ ., data=training_data[ , 3:55])
+randomForestFit
+```
+
+No separate cross-validation is necessary for our random forest model, because a method for calculating out-of-sample test set error is built cleverly into the process of constructing a random forest.  In a random forest model, the test set error "is estimated interally" by calculating multiple trees, bootstrapping a random "training" sample (~2/3 of cases) and witholding an internal "test" sample (~ 1/3 of cases) each time a tree is built (cf: Breiman).  This witheld "test" (aka "out of bag") sample is then run through the tree in order to calculate predicted classifications for all of these internal "test" cases.  These predicted classifications are then aggregated across each case and each tree, compared against the *true* classification for each case, and are then averaged to calculate the "out of bag" error rate.  This "out of bag" error rate turns out to be a very good approximate of the our expected test set error rate if we were to apply our model to novel testing data.
+
+**When using this random forest model, then, we expect our out of sample error rate to be quite low, as estimated by the "out of bag" estimate of the error rate--in this case, around 0.3%.**
+
+
+## Conclusion
+
+If our goal, then, is to maximize the predictive power of our model, we will likely want to use the random forest model described above, which minimizes our expected out of sample error rate.  If our goal, on the other hand, is *interpretability*, we may want to refer back to our simple, cross-validated 'rpart' decision tree to help discover patterns of interest in our data that may be useful to to weighlifters and trainers as they develop new inuitions about the movements involved in biceps curling techniques.
+
+
+
+## References
+
+* Breiman, L. & Cutler, A. "Random Forests". Retrieved from: http://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm#workings
+
+* Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. "Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13)". Stuttgart, Germany: ACM SIGCHI, 2013. Retrieved from: http://groupware.les.inf.puc-rio.br/har
+
